@@ -43,7 +43,11 @@ def get_or_create_job(resources, job_name, walltime, reservation_date):
         gridjob = make_reservation(resources, job_name, walltime,
             reservation_date)
     logging.info("Waiting for oargridjob %s to start" % gridjob)
-    ex5.wait_oargrid_job_start(gridjob)
+    # NOTE(msimonin): wrong tz in g5k nodes leads to wait one extra hour (in
+    # winter)
+    # UTC vs Europe/Paris
+    # quick and dirty workaround : don't wait, relaunch instead.
+    # ex5.wait_oargrid_job_start(gridjob)
     return gridjob
 
 
