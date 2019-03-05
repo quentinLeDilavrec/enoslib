@@ -1,22 +1,18 @@
 # -*- coding: utf-8 -*-
+import logging
+import socket
+
+from netaddr import IPAddress, IPNetwork, IPSet
 
 import enoslib.infra.enos_g5k.api as api
-from enoslib.infra.enos_g5k.schema import SCHEMA, KAVLAN_TYPE, SUBNET_TYPE
+from enoslib.infra.enos_g5k.schema import KAVLAN_TYPE, SUBNET_TYPE
 from enoslib.host import Host
 from enoslib.infra.provider import Provider
 from enoslib.utils import get_roles_as_list
-from netaddr import IPAddress, IPNetwork, IPSet
+from .constants import NAMESERVER
 
-import logging
+
 logger = logging.getLogger(__name__)
-
-#: The default configuration of the Grid5000 provider
-DEFAULT_CONFIG = {
-    'name': 'Enoslib',
-    'walltime': '02:00:00',
-    'env_name': 'debian9-x64-nfs',
-    'reservation': False,
-}
 
 
 def _to_enos_roles(roles):
@@ -34,6 +30,7 @@ def _to_enos_roles(roles):
         for nic, roles in h["nics"]:
             for role in roles:
                 extra[role] = nic
+
         return Host(h["host"], user="root", extra=extra)
 
     enos_roles = {}
@@ -55,7 +52,13 @@ def _to_enos_networks(networks):
         net = {
             "cidr": str(network["network"]),
             "gateway": str(network["gateway"]),
-            "dns": "131.254.203.235",
+            # NOTE(msimonin): This will point to the nameserver of the site
+            # where the deployment is launched regardless the actual site in
+            # the network description. Until now we used the global DNS IP
+            # here. Finally this information couldn't be found in the API (dec.
+            # 18) otherwise we'd move this logic in utils.concretize_networks
+            # (like network and gateway)
+            "dns": socket.gethostbyname(NAMESERVER),
             "roles": get_roles_as_list(network)
         }
         if network["type"] in KAVLAN_TYPE:
@@ -91,10 +94,15 @@ def _to_enos_networks(networks):
                 "end": str(IPAddress(ips.last))
             })
         elif network["type"] in SUBNET_TYPE:
+            start_ip, start_mac = network["ipmac"][0]
+            end_ip, end_mac = network["ipmac"][-1]
             net.update({
-                "start": network["ipmac"][0],
-                "end": network["ipmac"][-1]
+                "start": start_ip,
+                "end": end_ip,
+                "mac_start": start_mac,
+                "mac_end": end_mac
             })
+
         net.update({"roles": get_roles_as_list(network)})
         nets.append(net)
     logger.debug(nets)
@@ -102,63 +110,7 @@ def _to_enos_networks(networks):
 
 
 class G5k(Provider):
-    """The provider to use when deploying on Grid'5000
-
-        Examples:
-
-        .. code-block:: yaml
-
-            # provider_conf in yaml
-            ---
-            job_name: enoslib
-            walltime: 01:00:00
-            # will give all configured interfaces an IP
-            dhcp: True
-            # force_deploy: True
-            resources:
-                machines:
-                - roles: [telegraf]
-                    cluster: griffon
-                    nodes: 1
-                    primary_network: n1
-                    secondary_networks: [n2]
-                - roles:
-                    - control
-                        registry
-                        prometheus
-                        grafana
-                        telegraf
-                    cluster: griffon
-                    nodes: 1
-                    min: 1
-                    primary_network: n1
-                    secondary_networks: [n2]
-                networks:
-                - id: n1
-                    roles: [control_network]
-                    type: prod
-                    site: nancy
-                - id: n2
-                    roles: [internal_network]
-                    type: kavlan-local
-                    site: nancy
-
-
-        Supported network types are
-
-            - kavlan
-            - kavlan-local
-            - kavlan-global
-            - prod
-            - slash_22 (subnet reservation)
-            - slash_18 (subnet reservation)
-
-    Machines must use at least one network of type prod or kavlan*. Subnets are
-    optional and must not be linked to any interfaces as they are a way to
-    claim extra ips and corresponding macs. In this case the returned network
-    attributes `start` and `end` corresponds to the first and last mapping of
-    (ip, mac).
-    """
+    """The provider to use when deploying on Grid'5000."""
 
     def init(self, force_deploy=False):
         """Reserve and deploys the nodes according to the resources section
@@ -174,11 +126,12 @@ class G5k(Provider):
             NotEnoughNodesError: If the `min` constraints can't be met.
 
            """
-        resources = self.provider_conf["resources"]
-        r = api.Resources(resources)
-        # insert force_deploy
-        self.provider_conf.setdefault("force_deploy", force_deploy)
-        r.launch(**self.provider_conf)
+        self.provider_conf.force_deploy = force_deploy
+
+        # TODO remove the use of dict
+        self._provider_conf = self.provider_conf.to_dict()
+        r = api.Resources(self._provider_conf)
+        r.launch()
         roles = r.get_roles()
         networks = r.get_networks()
 
@@ -187,16 +140,9 @@ class G5k(Provider):
 
     def destroy(self):
         """Destroys the jobs."""
-        api.Resources.destroy(**self.provider_conf)
-        pass
-
-    def default_config(self):
-        """Default config."""
-        return DEFAULT_CONFIG
-
-    def schema(self):
-        """Returns the schema of the provider config"""
-        return SCHEMA
+        r = api.Resources(self._provider_conf)
+        # insert force_deploy
+        r.destroy()
 
     def __str__(self):
         return 'G5k'

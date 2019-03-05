@@ -1,23 +1,20 @@
-from enoslib.api import generate_inventory, emulate_network, validate_network
+from enoslib.api import check_networks, emulate_network, validate_network
 from enoslib.task import enostask
 from enoslib.infra.enos_vagrant.provider import Enos_vagrant
+from enoslib.infra.enos_vagrant.configuration import Configuration
 
-import os
 import logging
 logging.basicConfig(level=logging.INFO)
 
 provider_conf = {
-    "backend": "virtualbox",
-    "user": "root",
-    "box": "debian/jessie64",
     "resources": {
         "machines": [{
-            "role": "control",
+            "roles": ["control"],
             "flavor": "tiny",
             "number": 1,
             "networks": ["n1", "n2"]
         },{
-            "role": "compute",
+            "roles": ["compute"],
             "flavor": "tiny",
             "number": 1,
             "networks": ["n1", "n3"]
@@ -44,30 +41,28 @@ def cli():
 def up(force, env=None, **kwargs):
     """Starts a new experiment using vagrant"""
     inventory = os.path.join(os.getcwd(), "hosts")
-    provider = Enos_vagrant(provider_conf)
+    conf = Configuration.from_dictionnary(provider_conf)
+    provider = Enos_vagrant(conf)
     roles, networks = provider.init(force_deploy=force)
-    generate_inventory(roles, networks, inventory, check_networks=True)
+    check_networks(roles, networks)
     env["roles"] = roles
     env["networks"] = networks
-    env["inventory"] = inventory
 
 
 @cli.command()
 @enostask()
 def emulate(env=None, **kwargs):
     """Emulates the network."""
-    inventory = env["inventory"]
     roles = env["roles"]
-    emulate_network(roles, inventory, tc)
+    emulate_network(roles, tc)
 
 
 @cli.command()
 @enostask()
 def validate(env=None, **kwargs):
     """Validates the network constraints."""
-    inventory = env["inventory"]
     roles = env["roles"]
-    validate_network(roles, inventory)
+    validate_network(roles)
 
 
 if __name__ == '__main__':

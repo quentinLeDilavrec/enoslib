@@ -1,5 +1,6 @@
 from enoslib.api import generate_inventory, emulate_network, validate_network, wait_ssh
 from enoslib.infra.enos_openstack.provider import Openstack
+from enoslib.infra.enos_openstack.configuration import Configuration
 
 import logging
 import os
@@ -7,17 +8,18 @@ import os
 logging.basicConfig(level=logging.INFO)
 
 provider_conf = {
-    "key_name": "enos-matt",
+    "key_name": "enos_matt",
     "user": "cc",
     "image":"CC-Ubuntu16.04",
+    "prefix": "plop",
     "resources": {
         "machines": [{
-            "role": "control",
-            "flavor": "m1.medium",
+            "roles": ["control"],
+            "flavour": "m1.medium",
             "number": 1,
         },{
-            "role": "compute",
-            "flavor": "m1.medium",
+            "roles": ["compute"],
+            "flavour": "m1.medium",
             "number": 5,
         }],
         "networks": ["network_interface"]
@@ -30,7 +32,8 @@ tc = {
     "default_rate": "1gbit",
 }
 inventory = os.path.join(os.getcwd(), "hosts")
-provider = Openstack(provider_conf)
+conf = Configuration.from_dictionnary(provider_conf)
+provider = Openstack(conf)
 provider.destroy()
 roles, networks = provider.init()
 generate_inventory(roles, networks, inventory)

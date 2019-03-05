@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
-from enoslib.constants import SYMLINK_NAME
-from enoslib.errors import EnosFilePathError
 from functools import wraps
 import os
-import yaml
 import logging
+import yaml
+
+from enoslib.constants import SYMLINK_NAME
+from enoslib.errors import EnosFilePathError
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +94,12 @@ def _make_env(resultdir=None):
                 env.update(yaml.load(f))
                 logger.debug("Loaded environment %s", env_path)
 
-        # Resets the configuration of the environment
-        if os.path.isfile(env["config_file"]):
-            with open(env["config_file"], "r") as f:
-                env["config"].update(yaml.load(f))
-                logger.debug("Reloaded config %s", env["config"])
+        if "config_file" in env and env["config_file"] is not None:
+            # Resets the configuration of the environment
+            if os.path.isfile(env["config_file"]):
+                with open(env["config_file"], "r") as f:
+                    env["config"].update(yaml.load(f))
+                    logger.debug("Reloaded config %s", env["config"])
 
     return env
 
@@ -176,6 +178,6 @@ def _set_resultdir(name=None):
         # An harmless error can occur due to a race condition when
         # multiple regions are simultaneously deployed
         logger.warning("Symlink %s to %s failed" %
-                        (resultdir_path, link_path))
+                       (resultdir_path, link_path))
 
     return resultdir_path

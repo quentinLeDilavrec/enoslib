@@ -1,101 +1,51 @@
 # -*- coding: utf-8 -*-
-
-from enoslib.host import Host
-from enoslib.infra.utils import pick_things, mk_pools
-from enoslib.infra.provider import Provider
-from enoslib.utils import get_roles_as_list
-from glanceclient import client as glance
-from keystoneauth1.identity import v2
-from keystoneauth1 import session
-from neutronclient.neutron import client as neutron
-from novaclient import client as nova
-from operator import itemgetter
-
 import ipaddress
 import logging
+from operator import itemgetter
 import os
 import re
 import time
 
+from glanceclient import client as glance
+from keystoneauth1.identity import v2, v3
+from keystoneauth1 import session
+from neutronclient.neutron import client as neutron
+from novaclient import client as nova
+
+from enoslib.host import Host
+from enoslib.infra.utils import pick_things, mk_pools
+from enoslib.infra.provider import Provider
+from .constants import (NOVA_VERSION, GLANCE_VERSION, DEFAULT_PREFIX,
+                        SECGROUP_NAME, ROUTER_NAME)
+
 
 logger = logging.getLogger(__name__)
 
-PREFIX = 'enos'
-CONFIGURE_NETWORK = True
-NETWORK_NAME = "%s-network" % PREFIX
-SUBNET_NAME = "%s-subnet" % PREFIX
-
-# NOTE(msimonin): build the subnet following the good rules
-# https://www.chameleoncloud.org/docs/bare-metal-user-guide/network-isolation-bare-metal/
-# Some defaults
-SUBNET_CIDR = '10.87.23.0/24'
-ALLOCATION_POOL = {'start': '10.87.23.10', 'end': '10.87.23.100'}
-DNS_NAMESERVERS = ['8.8.8.8', '8.8.4.4']
-
-# These are private resources
-ROUTER_NAME = "%s-router" % PREFIX
-SECGROUP_NAME = "%s-secgroup" % PREFIX
-GLANCE_VERSION = '2'
-NEUTRON_VERSION = '2'
-NOVA_VERSION = '2.1'
-
 CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
-
-SCHEMA = {
-    "type": "object",
-    "properties": {
-        "resources": {"$ref": "#/resources"},
-        # Mandatory keys
-        "key_name": {"type": "string"},
-        "image": {"type": "string"},
-        "user": {"type": "string"}
-    },
-    "additionalProperties": True,
-    "required": ["resources", "key_name", "image", "user"],
-
-    "resources": {
-        "title": "Resource",
-
-        "type": "object",
-        "properties": {
-            "machines": {"type": "array", "items": {"$ref": "#/machine"}},
-            "networks": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 1,
-#                "maxItems": 1
-            }
-        },
-        "additionalProperties": False,
-        "required": ["machines", "networks"]
-    },
-
-    "machine": {
-        "title": "Compute",
-        "type": "object",
-        "properties": {
-            "anyOf": [
-                {"roles": {"type": "array", "items": {"type": "string"}}},
-                {"role": {"type": "string"}}
-            ],
-            "flavor": {"type": "string"},
-            "number": {"type": "number"}
-        },
-        "required": [
-            "number",
-            "flavor"
-        ]
-    }
-}
 
 
 def get_session():
     """Build the session object."""
-    auth = v2.Password(
-        auth_url=os.environ["OS_AUTH_URL"],
-        username=os.environ["OS_USERNAME"],
-        password=os.environ["OS_PASSWORD"],
-        tenant_id=os.environ["OS_TENANT_ID"])
+    # NOTE(msimonin): We provide only a basic support which focus
+    # Chameleon cloud and its rc files
+    if os.environ.get("OS_IDENTITY_API_VERSION") == "3":
+        logging.info("Creating a v3 Keystone Session")
+        auth = v3.Password(
+            auth_url=os.environ["OS_AUTH_URL"],
+            username=os.environ["OS_USERNAME"],
+            password=os.environ["OS_PASSWORD"],
+            project_id=os.environ["OS_PROJECT_ID"],
+            user_domain_name=os.environ["OS_USER_DOMAIN_NAME"]
+        )
+
+    else:
+        logging.info("Creating a v2 Keystone Session")
+        auth = v2.Password(
+            auth_url=os.environ["OS_AUTH_URL"],
+            username=os.environ["OS_USERNAME"],
+            password=os.environ["OS_PASSWORD"],
+            tenant_id=os.environ["OS_TENANT_ID"])
+
     return session.Session(auth=auth)
 
 
@@ -105,10 +55,11 @@ def check_glance(session, image_name):
     Fails if the base image isn't added.
     This means the image should be added manually.
     """
-    gclient = glance.Client(GLANCE_VERSION, session=session)
+    gclient = glance.Client(GLANCE_VERSION, session=session,
+                            region_name=os.environ['OS_REGION_NAME'])
     images = gclient.images.list()
     name_ids = [{'name': i['name'], 'id': i['id']} for i in images]
-    if image_name not in map(itemgetter('name'), name_ids):
+    if image_name not in list(map(itemgetter('name'), name_ids)):
         logger.error("[glance]: Image %s is missing" % image_name)
         raise Exception("Image %s is missing" % image_name)
     else:
@@ -118,32 +69,34 @@ def check_glance(session, image_name):
     return image_id
 
 
-def check_flavors(session, resources):
+def check_flavors(session):
     """Build the flavors mapping
 
     returns the mappings id <-> flavor
     """
-    nclient = nova.Client(NOVA_VERSION, session=session)
+    nclient = nova.Client(NOVA_VERSION, session=session,
+                          region_name=os.environ['OS_REGION_NAME'])
     flavors = nclient.flavors.list()
-    to_id = dict(map(lambda n: [n.name, n.id], flavors))
-    to_flavor = dict(map(lambda n: [n.id, n.name], flavors))
+    to_id = dict(list(map(lambda n: [n.name, n.id], flavors)))
+    to_flavor = dict(list(map(lambda n: [n.id, n.name], flavors)))
     return to_id, to_flavor
 
 
 def check_network(session, configure_network, network, subnet,
-        dns_nameservers=None, allocation_pool=None):
+                  dns_nameservers=None, allocation_pool=None):
     """Check the network status for the deployment.
 
     If needed, it creates a dedicated :
         * private network /subnet
         * router between this network and the external network
     """
-    nclient = neutron.Client('2', session=session)
+    nclient = neutron.Client('2', session=session,
+                             region_name=os.environ['OS_REGION_NAME'])
 
     # Check the security groups
     secgroups = nclient.list_security_groups()['security_groups']
     secgroup_name = SECGROUP_NAME
-    if secgroup_name not in map(itemgetter('name'), secgroups):
+    if secgroup_name not in list(map(itemgetter('name'), secgroups)):
         secgroup = {'name': secgroup_name,
                     'description': 'Enos Security Group'}
         res = nclient.create_security_group({'security_group': secgroup})
@@ -167,7 +120,7 @@ def check_network(session, configure_network, network, subnet,
 
     networks = nclient.list_networks()['networks']
     network_name = network['name']
-    if network_name not in map(itemgetter('name'), networks):
+    if network_name not in list(map(itemgetter('name'), networks)):
         network = {'name': network_name}
         res = nclient.create_network({'network': network})
         network = res['network']
@@ -184,15 +137,15 @@ def check_network(session, configure_network, network, subnet,
 
     subnets = nclient.list_subnets()['subnets']
     subnet_name = subnet['name']
-    if (subnet_name not in map(itemgetter('name'), subnets) and
-            configure_network):
+    if (subnet_name not in list(map(itemgetter('name'), subnets))
+            and configure_network):
         subnet = {'name': subnet['name'],
-        'network_id': network['id'],
-        # NOTE(msimonin): using the dns of chameleon
-        # for a generic openstack provider we should think to
-        # parameteried this or use public available dns
-        'cidr': subnet['cidr'],
-        'ip_version': 4}
+                  'network_id': network['id'],
+                  # NOTE(msimonin): using the dns of chameleon
+                  # for a generic openstack provider we should think to
+                  # parameteried this or use public available dns
+                  'cidr': subnet['cidr'],
+                  'ip_version': 4}
         if dns_nameservers is not None:
             subnet.update({'dns_nameservers': dns_nameservers})
         if allocation_pool is not None:
@@ -210,8 +163,8 @@ def check_network(session, configure_network, network, subnet,
     routers = nclient.list_routers()
     router_name = ROUTER_NAME
     logger.debug(routers)
-    if (router_name not in map(itemgetter('name'), routers['routers']) and
-            configure_network):
+    router_present = router_name not in [r['name'] for r in routers['routers']]
+    if (router_present and configure_network):
         router = {
             'name': router_name,
             'external_gateway_info': {
@@ -225,13 +178,14 @@ def check_network(session, configure_network, network, subnet,
         interface = {
             'subnet_id': subnet['id'].encode('UTF-8')
         }
-        nclient.add_interface_router(r['router']['id'], interface)
+        nclient.add_interface_router(str(r['router']['id']), interface)
 
     return (ext_net, network, subnet)
 
 
-def get_free_floating_ip(env):
-    nclient = neutron.Client('2', session=env['session'])
+def set_free_floating_ip(env, server_id):
+    nclient = neutron.Client('2', session=env['session'],
+                             region_name=os.environ['OS_REGION_NAME'])
     fips = nclient.list_floatingips()['floatingips']
     fips = [fip for fip in fips if fip['fixed_ip_address'] is None]
     if len(fips) > 0:
@@ -242,7 +196,13 @@ def get_free_floating_ip(env):
         fip = nclient.create_floatingip({'floatingip': floatingip})
         fip = fip['floatingip']
     logger.info("[neutron]: Using floating ip: %s", fip)
-    return fip
+
+    # Getting the port fior server_id
+    ports = nclient.list_ports(device_id=server_id).get('ports')
+    port_id = ports[0]['id']
+    logger.info("[neutron]: Associate floating ip with the port %s" % ports)
+    nclient.update_floatingip(fip['id'], {'floatingip': {'port_id': port_id}})
+    return fip['floating_ip_address']
 
 
 def wait_for_servers(session, servers):
@@ -250,7 +210,8 @@ def wait_for_servers(session, servers):
 
     Note(msimonin): we don't garantee the SSH connection to be ready.
     """
-    nclient = nova.Client(NOVA_VERSION, session=session)
+    nclient = nova.Client(NOVA_VERSION, session=session,
+                          region_name=os.environ['OS_REGION_NAME'])
     while True:
         deployed = []
         undeployed = []
@@ -269,24 +230,27 @@ def wait_for_servers(session, servers):
     return deployed, undeployed
 
 
-def _get_total_wanted_machines(resources):
-    total = sum([machine["number"] for machine in resources["machines"]])
+def _get_total_wanted_machines(machines):
+    total = sum([machine.number for machine in machines])
     return total
 
 
-def check_servers(session, resources, extra_prefix="",
-        force_deploy=False, key_name=None, image_id=None,
-        flavors='m1.medium', network=None, ext_net=None, scheduler_hints=None):
+def check_servers(session, machines, extra_prefix="",
+                  force_deploy=False, key_name=None, image_id=None,
+                  flavors='m1.medium', network=None, ext_net=None,
+                  scheduler_hints=None):
     """Checks the servers status for the deployment.
 
     If needed, it creates new servers and add a floating ip to one of them.
     This server can be used as a gateway to the others.
     """
-    scheduler_hints = scheduler_hints or {}
-    nclient = nova.Client(NOVA_VERSION, session=session)
+
+    scheduler_hints = scheduler_hints or []
+    nclient = nova.Client(NOVA_VERSION, session=session,
+                          region_name=os.environ['OS_REGION_NAME'])
     servers = nclient.servers.list(
-        search_opts={'name': '-'.join([PREFIX, extra_prefix])})
-    wanted = _get_total_wanted_machines(resources)
+        search_opts={'name': '-'.join([DEFAULT_PREFIX, extra_prefix])})
+    wanted = _get_total_wanted_machines(machines)
     if force_deploy:
         for server in servers:
             server.delete()
@@ -300,27 +264,34 @@ def check_servers(session, resources, extra_prefix="",
 
     # starting the servers
     total = 0
-    for machine in resources["machines"]:
-        number = machine["number"]
-        roles = get_roles_as_list(machine)
+    for machine in machines:
+        number = machine.number
+        roles = machine.roles
         logger.info("[nova]: Starting %s servers" % number)
         logger.info("[nova]: for roles %s" % roles)
         logger.info("[nova]: with extra hints %s" % scheduler_hints)
         for _ in range(number):
-            flavor = machine["flavor"]
+            flavor = machine.flavour
             if isinstance(flavors, str):
                 flavor = flavors
             else:
                 flavor_to_id, _ = flavors
                 flavor = flavor_to_id[flavor]
+
+            if scheduler_hints:
+                _scheduler_hints = \
+                    scheduler_hints[total % len(scheduler_hints)]
+            else:
+                _scheduler_hints = []
+
             server = nclient.servers.create(
-                name='-'.join([PREFIX, extra_prefix, str(total)]),
+                name='-'.join([DEFAULT_PREFIX, extra_prefix, str(total)]),
                 image=image_id,
                 flavor=flavor,
                 nics=[{'net-id': network['id']}],
                 key_name=key_name,
                 security_groups=[SECGROUP_NAME],
-                scheduler_hints=scheduler_hints)
+                scheduler_hints=_scheduler_hints)
             servers.append(server)
             total = total + 1
     return servers
@@ -329,27 +300,30 @@ def check_servers(session, resources, extra_prefix="",
 def check_gateway(env, with_gateway, servers):
     gateway = sorted(servers, key=lambda s: s.id)[0]
     if with_gateway:
-        nclient = nova.Client(NOVA_VERSION, session=env['session'])
+        nclient = nova.Client(NOVA_VERSION, session=env['session'],
+                              region_name=os.environ['OS_REGION_NAME'])
         gateway = nclient.servers.get(gateway.id)
         gw_floating_ips = [
             n for n in gateway.addresses[env['network']['name']]
-                if n['OS-EXT-IPS:type'] == 'floating'
+            if n['OS-EXT-IPS:type'] == 'floating'
         ]
         if len(gw_floating_ips) == 0:
-            fip = get_free_floating_ip(env)
-            gateway.add_floating_ip(fip['floating_ip_address'])
-            gateway = nclient.servers.get(gateway.id)
-        # else gateway already has an fip
-        logger.info("[nova]: Reusing %s as gateway" % gateway)
-    return gateway
+            gateway_ip = set_free_floating_ip(env, gateway.id)
+        else:
+            gateway_ip = gw_floating_ips[0]['addr']
+
+        logger.info("[nova]: Reusing %s as gateway with ip %s",
+                    gateway,
+                    gateway_ip)
+    return gateway_ip, gateway
 
 
 def is_in_current_deployment(server, extra_prefix=""):
     """Check if an existing server in the system take part to
     the current deployment
     """
-    return re.match(r"^%s" % '-'.join([PREFIX, extra_prefix]),
-            server.name) is not None
+    return re.match(r"^%s" % '-'.join([DEFAULT_PREFIX, extra_prefix]),
+                    server.name) is not None
 
 
 def allow_address_pairs(session, network, subnet):
@@ -357,13 +331,14 @@ def allow_address_pairs(session, network, subnet):
 
     This is particularly useful when working with virtual ips.
     """
-    nclient = neutron.Client('2', session=session)
+    nclient = neutron.Client('2', session=session,
+                             region_name=os.environ['OS_REGION_NAME'])
     ports = nclient.list_ports()
     ports_to_update = filter(
         lambda p: p['network_id'] == network['id'],
         ports['ports'])
     logger.info('[nova]: Allowing address pairs for ports %s' %
-            map(lambda p: p['fixed_ips'], ports_to_update))
+                list(map(lambda p: p['fixed_ips'], ports_to_update)))
     for port in ports_to_update:
         try:
             nclient.update_port(port['id'], {
@@ -384,15 +359,15 @@ def allow_address_pairs(session, network, subnet):
 def check_environment(provider_conf):
     """Check all ressources needed by Enos."""
     session = get_session()
-    image_id = check_glance(session, provider_conf['image'])
-    flavor_to_id, id_to_flavor = check_flavors(session,
-                                               provider_conf['resources'])
-    ext_net, network, subnet = check_network(session,
-        provider_conf['configure_network'],
-        provider_conf['network'],
-        subnet=provider_conf['subnet'],
-        dns_nameservers=provider_conf['dns_nameservers'],
-        allocation_pool=provider_conf['allocation_pool'])
+    image_id = check_glance(session, provider_conf.image)
+    flavor_to_id, id_to_flavor = check_flavors(session)
+    ext_net, network, subnet = check_network(
+        session,
+        provider_conf.configure_network,
+        provider_conf.network,
+        subnet=provider_conf.subnet,
+        dns_nameservers=provider_conf.dns_nameservers,
+        allocation_pool=provider_conf.allocation_pool)
 
     return {
         'session': session,
@@ -405,15 +380,15 @@ def check_environment(provider_conf):
     }
 
 
-def finalize(env, provider_conf, gateway, servers, keyfnc, extra_ips=None):
-    def build_roles(resources, env, servers, keyfnc):
+def finalize(env, provider_conf, gateway_ip, servers, keyfnc, extra_ips=None):
+    def build_roles(provider_conf, env, servers, keyfnc):
         result = {}
         pools = mk_pools(servers, keyfnc)
-        machines = resources["machines"]
+        machines = provider_conf.machines
         for desc in machines:
-            flavor = desc["flavor"]
-            nb = desc["number"]
-            roles = get_roles_as_list(desc)
+            flavor = desc.flavour
+            nb = desc.number
+            roles = desc.roles
             nodes = pick_things(pools, flavor, nb)
             for role in roles:
                 result.setdefault(role, []).extend(nodes)
@@ -422,21 +397,14 @@ def finalize(env, provider_conf, gateway, servers, keyfnc, extra_ips=None):
 
     # Distribute the machines according to the resource/topology
     # specifications
-    os_roles = build_roles(provider_conf["resources"], env, servers, keyfnc)
+    os_roles = build_roles(provider_conf, env, servers, keyfnc)
 
     extra = {}
-    network_name = provider_conf['network']['name']
-    if provider_conf['gateway']:
-        gw_floating_ip = [
-            n for n in gateway.addresses[network_name]
-                if n['OS-EXT-IPS:type'] == 'floating'
-        ]
-        gw_floating_ip = gw_floating_ip[0]['addr']
-        user = provider_conf.get('user')
-        gw_user = provider_conf.get('gateway_user', user)
+    network_name = provider_conf.network['name']
+    if provider_conf.gateway:
         extra.update({
-            'gateway': gw_floating_ip,
-            'gateway_user': gw_user,
+            'gateway': gateway_ip,
+            'gateway_user': provider_conf.gateway_user,
             'forward_agent': True
             })
     extra.update({'ansible_become': 'yes'})
@@ -450,7 +418,7 @@ def finalize(env, provider_conf, gateway, servers, keyfnc, extra_ips=None):
                 # NOTE(msimonin): the alias is used by ansible and thus
                 # must be an ascii hostname
                 alias=str(server.name),
-                user=provider_conf['user'],
+                user=provider_conf.user,
                 extra=extra))
 
     # build the network
@@ -463,10 +431,9 @@ def finalize(env, provider_conf, gateway, servers, keyfnc, extra_ips=None):
         'extra_ips': extra_ips,
         'gateway': env['subnet']["gateway_ip"],
         'dns': '8.8.8.8',
-        'roles': provider_conf["resources"].get(
-            "networks", ["default_network"]
-        )
+        'roles': provider_conf.networks
     }
+
     return roles, [network]
 
 
@@ -474,12 +441,14 @@ class Openstack(Provider):
 
     def init(self, force_deploy=False):
         logger.info("Checking the existing environment")
+
         env = check_environment(self.provider_conf)
         servers = check_servers(
             env['session'],
-            self.provider_conf['resources'],
+            self.provider_conf.machines,
+            extra_prefix=self.provider_conf.prefix,
             force_deploy=force_deploy,
-            key_name=self.provider_conf.get('key_name'),
+            key_name=self.provider_conf.key_name,
             image_id=env['image_id'],
             flavors=(env['flavor_to_id'], env['id_to_flavor']),
             network=env['network'],
@@ -491,40 +460,28 @@ class Openstack(Provider):
 
         deployed = sorted(deployed, key=lambda s: s.name)
 
-        gateway = check_gateway(
+        gateway_ip, _ = check_gateway(
             env,
-            self.provider_conf.get('gateway', False),
+            self.provider_conf.gateway,
             deployed)
 
         allow_address_pairs(env['session'],
-            env['network'],
-            self.provider_conf['subnet']['cidr'])
+                            env['network'],
+                            self.provider_conf.subnet['cidr'])
 
         # NOTE(msimonin): polling is missing
         # we aren't sure that machines are ssh-reachable
         # this is delegated to a global ansible playbook
         return finalize(env,
                         self.provider_conf,
-                        gateway,
+                        gateway_ip,
                         servers,
                         lambda s: env['id_to_flavor'][s.flavor['id']])
 
-    def default_config(self):
-        return {
-            'configure_network': CONFIGURE_NETWORK,
-            'network': {'name': NETWORK_NAME},
-            'subnet': {'name': SUBNET_NAME, 'cidr': SUBNET_CIDR},
-            'dns_nameservers': DNS_NAMESERVERS,
-            'allocation_pool': ALLOCATION_POOL,
-            'gateway': True,
-            }
-
-    def schema(self):
-        return SCHEMA
-
     def destroy(self):
         session = get_session()
-        nclient = nova.Client(NOVA_VERSION, session=session)
+        nclient = nova.Client(NOVA_VERSION, session=session,
+                              region_name=os.environ['OS_REGION_NAME'])
         servers = nclient.servers.list()
         for server in servers:
             if is_in_current_deployment(server):

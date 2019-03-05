@@ -1,4 +1,9 @@
 # -*- coding: utf-8 -*-
+import logging
+
+from execo import Host
+import execo_g5k as ex5
+import execo_g5k.api_utils as api
 
 from enoslib.infra.enos_g5k import remote
 from enoslib.infra.enos_g5k.error import (MissingNetworkError,
@@ -6,10 +11,7 @@ from enoslib.infra.enos_g5k.error import (MissingNetworkError,
 from enoslib.infra.enos_g5k.schema import (PROD, KAVLAN_GLOBAL, KAVLAN_LOCAL,
                                            KAVLAN, KAVLAN_TYPE, SUBNET_TYPE)
 from enoslib.infra.utils import pick_things, mk_pools
-from execo import Host
-import execo_g5k as ex5
-import execo_g5k.api_utils as api
-import logging
+
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +23,20 @@ def dhcp_interfaces(c_resources):
         nics = desc.get("_c_nics", [])
         nics_list = [nic for nic, _ in nics]
         ifconfig = ["ip link set %s up" % nic for nic in nics_list]
-        cmd = "%s ; dhclient %s" % (";".join(ifconfig), " ".join(nics_list))
+        dhcp = ["dhclient %s" % nic for nic in nics_list]
+        cmd = "%s ; %s" % (";".join(ifconfig), ";".join(dhcp))
         remote.exec_command_on_nodes(desc["_c_ssh_nodes"],
-                                     cmd,
-                                     cmd)
+                                     cmd, cmd)
+
+
+def grant_root_access(c_resources):
+    machines = c_resources["machines"]
+    for desc in machines:
+        cmd = ["cat ~/.ssh/id_rsa.pub"]
+        cmd.append("sudo-g5k tee -a /root/.ssh/authorized_keys")
+        cmd = "|".join(cmd)
+        remote.exec_command_on_nodes(desc["_c_nodes"],
+                                     cmd, cmd, conn_params={})
 
 
 def is_prod(network, networks):
@@ -35,7 +47,7 @@ def is_prod(network, networks):
 def to_vlan_type(vlan_id):
     if vlan_id < 4:
         return KAVLAN_LOCAL
-    elif vlan_id < 10:
+    if vlan_id < 10:
         return KAVLAN
     return KAVLAN_GLOBAL
 
@@ -44,44 +56,68 @@ def to_subnet_type(ip_prefix):
     return "slash_%s" % ip_prefix[-2:]
 
 
-def get_or_create_job(resources, job_name, walltime, reservation_date, queue):
+def grid_get_or_create_job(job_name, walltime, reservation_date,
+                           queue, job_type, machines, networks):
     gridjob, _ = ex5.planning.get_job_by_name(job_name)
     if gridjob is None:
-        gridjob = make_reservation(resources, job_name, walltime,
-            reservation_date, queue)
+        gridjob = grid_make_reservation(job_name, walltime, reservation_date,
+                                        queue, job_type, machines, networks)
     logger.info("Waiting for oargridjob %s to start" % gridjob)
     ex5.wait_oargrid_job_start(gridjob)
     return gridjob
 
 
-def concretize_resources(resources, gridjob):
+def get_network_info_from_job_id(job_id, site, vlans, subnets):
+    vlan_ids = ex5.get_oar_job_kavlan(job_id, site)
+    vlans.extend([{
+        "site": site,
+        "vlan_id": vlan_id} for vlan_id in vlan_ids])
+    # NOTE(msimonin): this currently returned only one subnet
+    # even if several are reserved
+    # We'll need to patch execo the same way it has been patched for vlans
+    ipmac, info = ex5.get_oar_job_subnets(job_id, site)
+    if not ipmac:
+        logger.debug("No subnet information found for this job")
+        return vlans, subnets
+    subnet = {
+        "site": site,
+        "ipmac": ipmac,
+    }
+    subnet.update(info)
+    # Mandatory key when it comes to concretize resources
+    subnet.update({"network": info["ip_prefix"]})
+    subnets.append(subnet)
+    return vlans, subnets
+
+
+def grid_reload_from_id(gridjob):
+    logger.info("Reloading the resources from oargrid job %s", gridjob)
+    gridjob = int(gridjob)
     nodes = ex5.get_oargrid_job_nodes(gridjob)
-    concretize_nodes(resources, nodes)
 
     job_sites = ex5.get_oargrid_job_oar_jobs(gridjob)
     vlans = []
     subnets = []
     for (job_id, site) in job_sites:
-        vlan_ids = ex5.get_oar_job_kavlan(job_id, site)
-        vlans.extend([{
-            "site": site,
-            "vlan_id": vlan_id} for vlan_id in vlan_ids])
-        # NOTE(msimonin): this currently returned only one subnet
-        # even if several are reserved
-        # We'll need to patch execo the same way it has been patched for vlans
-        ipmac, info = ex5.get_oar_job_subnets(job_id, site)
-        if not ipmac:
-            logger.debug("No subnet information found for this job")
-            continue
-        subnet = {
-            "site": site,
-            "ipmac": ipmac,
-         }
-        subnet.update(info)
-        # Mandatory key when it comes to concretize resources
-        subnet.update({"network": info["ip_prefix"]})
-        subnets.append(subnet)
-    concretize_networks(resources, vlans, subnets)
+        vlans, subnets = get_network_info_from_job_id(job_id,
+                                                      site,
+                                                      vlans,
+                                                      subnets)
+    return nodes, vlans, subnets
+
+
+def oar_reload_from_id(oarjob, site):
+    logger.info("Reloading the resources from oar job %s", oarjob)
+    job_id = int(oarjob)
+    nodes = ex5.get_oar_job_nodes(job_id)
+
+    vlans = []
+    subnets = []
+    vlans, subnets = get_network_info_from_job_id(job_id,
+                                                  site,
+                                                  vlans,
+                                                  subnets)
+    return nodes, vlans, subnets
 
 
 def _deploy(nodes, force_deploy, options):
@@ -125,10 +161,8 @@ def _mount_secondary_nics(desc, networks):
         nic_device, nic_name = nics[idx]
         nodes_to_set = [Host(n) for n in desc["_c_nodes"]]
         vlan_id = net["_c_network"]["vlan_id"]
-        logger.info("Put %s, %s in vlan id %s for nodes %s" % (nic_device,
-                                                            nic_name,
-                                                            vlan_id,
-                                                            nodes_to_set))
+        logger.info("Put %s, %s in vlan id %s for nodes %s" %
+                    (nic_device, nic_name, vlan_id, nodes_to_set))
         api.set_nodes_vlan(net["site"],
                            nodes_to_set,
                            nic_device,
@@ -136,6 +170,10 @@ def _mount_secondary_nics(desc, networks):
         # recording the mapping, just in case
         desc["_c_nics"].append((nic_name, get_roles_as_list(net)))
         idx = idx + 1
+
+
+def get_cluster_site(cluster):
+    return ex5.get_cluster_site(cluster)
 
 
 def get_cluster_interfaces(cluster, extra_cond=lambda nic: True):
@@ -150,9 +188,10 @@ def get_cluster_interfaces(cluster, extra_cond=lambda nic: True):
     # https://intranet.grid5000.fr/bugzilla/show_bug.cgi?id=9272
     # When its fixed we should be able to only use the new predictable name.
     nics = [(nic['device'], nic['name']) for nic in nics
-           if nic['mountable'] and
-           nic['interface'] == 'Ethernet' and
-           not nic['management'] and extra_cond(nic)]
+            if nic['mountable']
+            and nic['interface'] == 'Ethernet'
+            and not nic['management']
+            and extra_cond(nic)]
     nics = sorted(nics)
     return nics
 
@@ -188,6 +227,7 @@ def concretize_nodes(resources, nodes):
         c_nodes = pick_things(pools, cluster, nb)
         #  put concrete hostnames here
         desc["_c_nodes"].extend([c_node.address for c_node in c_nodes])
+    return resources
 
 
 def concretize_networks(resources, vlans, subnets):
@@ -222,24 +262,23 @@ def concretize_networks(resources, vlans, subnets):
                 raise MissingNetworkError(site, n_type)
             desc["_c_network"] = networks[0]
 
+    return resources
 
-def make_reservation(resources, job_name, walltime,
-    reservation_date, queue):
-    machines = resources["machines"]
-    networks = resources["networks"]
 
+def _build_reservation_criteria(machines, networks):
     criteria = {}
     # machines reservations
     for desc in machines:
         cluster = desc["cluster"]
         nodes = desc["nodes"]
-        site = api.get_cluster_site(cluster)
-        criterion = "{cluster='%s'}/nodes=%s" % (cluster, nodes)
-        criteria.setdefault(site, []).append(criterion)
+        if nodes:
+            site = api.get_cluster_site(cluster)
+            criterion = "{cluster='%s'}/nodes=%s" % (cluster, nodes)
+            criteria.setdefault(site, []).append(criterion)
 
     # network reservations
     vlans = [network for network in networks
-            if network["type"] in KAVLAN_TYPE]
+             if network["type"] in KAVLAN_TYPE]
     for desc in vlans:
         site = desc["site"]
         n_type = desc["type"]
@@ -254,26 +293,54 @@ def make_reservation(resources, job_name, walltime,
         criterion = "%s=1" % n_type
         criteria.setdefault(site, []).append(criterion)
 
-    jobs_specs = [(ex5.OarSubmission(resources='+'.join(c),
-                                 name=job_name), s)
-                    for s, c in criteria.items()]
+    return criteria
 
-    # Make the reservation
+
+def _do_grid_make_reservation(criteria, job_name, walltime, reservation_date,
+                              queue, job_type):
+    jobs_specs = [(ex5.OarSubmission(resources='+'.join(c),
+                                     name=job_name), s)
+                  for s, c in criteria.items()]
     gridjob, _ = ex5.oargridsub(
         jobs_specs,
         walltime=walltime,
         reservation_date=reservation_date,
-        job_type='deploy',
+        job_type=job_type,
         queue=queue)
-
     if gridjob is None:
         raise Exception('No oar job was created')
+
     return gridjob
 
 
-def destroy(job_name):
+def grid_make_reservation(job_name, walltime, reservation_date,
+                          queue, job_type, machines, networks):
+    criteria = _build_reservation_criteria(machines, networks)
+    gridjob = _do_grid_make_reservation(criteria, job_name, walltime,
+                                        reservation_date, queue, job_type)
+
+    return gridjob
+
+
+def grid_destroy_from_name(job_name):
     """Destroy the job."""
     gridjob, _ = ex5.planning.get_job_by_name(job_name)
     if gridjob is not None:
         ex5.oargriddel([gridjob])
         logger.info("Killing the job %s" % gridjob)
+
+
+def grid_destroy_from_id(gridjob):
+    """Destroy the job."""
+    gridjob = int(gridjob)
+    if gridjob is not None:
+        ex5.oargriddel([gridjob])
+        logger.info("Killing the job %s" % gridjob)
+
+
+def oar_destroy_from_id(oarjob, site):
+    """Destroy the job."""
+    oarjob = int(oarjob)
+    if oarjob is not None and site is not None:
+        ex5.oardel([[oarjob, site]])
+        logger.info("Killing the job %s" % oarjob)

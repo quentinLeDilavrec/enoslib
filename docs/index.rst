@@ -13,7 +13,7 @@ using tasks.
 
 More pragmatically, with the EnOSlib, you can iterate on your application
 deployment and experimental workflow locally before moving to a large testbed
-like Grid'5000, or Chameleon. Is saves time and energy.
+like Grid'5000, or Chameleon. It saves time and energy.
 
 .. hint ::
 
@@ -32,3 +32,4 @@ like Grid'5000, or Chameleon. Is saves time and energy.
 
    tutorials/index.rst
    apidoc/index.rst
+   theyuseit.rst

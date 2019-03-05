@@ -1,5 +1,6 @@
 from enoslib.api import generate_inventory, emulate_network, validate_network
 from enoslib.infra.enos_g5k.provider import G5k
+from enoslib.infra.enos_g5k.configuration import Configuration
 
 import logging
 import os
@@ -9,7 +10,7 @@ logging.basicConfig(level=logging.INFO)
 provider_conf = {
     "resources": {
         "machines": [{
-            "role": "control",
+            "roles": ["control"],
             "cluster": "parapluie",
             "nodes": 1,
             "primary_network": "n1",
@@ -19,13 +20,13 @@ provider_conf = {
           {
             "id": "n1",
             "type": "prod",
-            "role": "my_network",
+            "roles": ["my_network"],
             "site": "rennes"
           },
           {
             "id": "not_linked_to_any_machine",
             "type": "slash_22",
-            "role": "my_subnet",
+            "roles": ["my_subnet"],
             "site": "rennes",
          }]
     }
@@ -35,21 +36,24 @@ provider_conf = {
 inventory = os.path.join(os.getcwd(), "hosts")
 
 # claim the resources
-provider = G5k(provider_conf)
+conf = Configuratin.from_dictionnary(provider_conf)
+provider = G5k(conf)
 roles, networks = provider.init()
 
 # Retrieving subnet
 subnet = [n for n in networks if "my_subnet" in n["roles"]]
 logging.info(subnet)
 # This returns the subnet information
-# [{
-#    'cidr': '10.158.12.0/22',
-#    'start': ('10.158.12.1', '00:16:3E:9E:0C:01'), 
-#    'gateway': '10.159.255.254', 
-#    'end': ('10.158.15.254', '00:16:3E:9E:0F:FE'), 
-#    'roles': ['my_subnet'], 'dns': '131.254.203.235'
-# }]
-# 
+# {
+#    'roles': ['my_subnet'],
+#    'start': '10.158.0.1',
+#    'dns': '131.254.203.235',
+#    'end': '10.158.3.254',
+#    'cidr': '10.158.0.0/22',
+#    'gateway': '10.159.255.254'
+#    'mac_end': '00:16:3E:9E:03:FE',
+#    'mac_start': '00:16:3E:9E:00:01',
+# } 
 
 # generate an inventory compatible with ansible
 generate_inventory(roles, networks, inventory, check_networks=True)

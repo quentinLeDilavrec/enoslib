@@ -1,38 +1,35 @@
-from enoslib.api import generate_inventory, emulate_network, validate_network
+from enoslib.api import discover_networks
 from enoslib.infra.enos_vagrant.provider import Enos_vagrant
+from enoslib.infra.enos_vagrant.configuration import Configuration
 
 import logging
-import os
 
 logging.basicConfig(level=logging.INFO)
 
 provider_conf = {
-    "backend": "virtualbox",
-    "user": "root",
     "resources": {
         "machines": [{
-            "role": "control",
-            "flavor": "tiny",
+            "roles": ["control"],
+            "flavour": "tiny",
             "number": 1,
-            "networks": ["n1"]
         },{
             "roles": ["control", "compute"],
-            "flavor": "tiny",
+            "flavour": "tiny",
             "number": 1,
-            "networks": ["n1"]
-        }]
+        }],
+        "networks": [{"roles": ["r1"], "cidr": "172.16.42.0/16"}]
     }
 }
 
-# path to the inventory
-inventory = os.path.join(os.getcwd(), "hosts")
-
 # claim the resources
-provider = Enos_vagrant(provider_conf)
+conf = Configuration.from_dictionnary(provider_conf)
+provider = Enos_vagrant(conf)
 roles, networks = provider.init()
 
-# generate an inventory compatible with ansible
-generate_inventory(roles, networks, inventory, check_networks=True)
+# decorate hosts with network information
+discover_networks(roles, networks)
+
+print(roles)
 
 # destroy the boxes
 provider.destroy()

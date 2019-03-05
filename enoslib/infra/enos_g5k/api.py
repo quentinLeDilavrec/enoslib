@@ -1,14 +1,33 @@
 # -*- coding: utf-8 -*-
 
 import copy
-import enoslib.infra.enos_g5k.utils as utils
-import execo_g5k as EX5
+
 from itertools import groupby
 from operator import itemgetter
 
-ENV_NAME = "debian9-x64-nfs"
-JOB_NAME = "deploy5k"
-WALLTIME = "02:00:00"
+from enoslib.infra.enos_g5k import remote
+from enoslib.infra.enos_g5k import utils
+from enoslib.infra.enos_g5k.driver import get_driver
+from enoslib.infra.enos_g5k.constants import DEFAULT_ENV_NAME, JOB_TYPE_DEPLOY
+
+
+def get_clusters_sites(clusters):
+    """ Returns the name of the site for each cluster.
+
+    Args:
+        clusters (str): list of clusters
+
+    Returns:
+        dict of cluster with its associated site
+
+    """
+
+    sites = {}
+    for cluster in clusters:
+        site = utils.get_cluster_site(cluster)
+        sites.setdefault(cluster, site)
+
+    return sites
 
 
 def get_clusters_interfaces(clusters, extra_cond=lambda nic: True):
@@ -31,20 +50,29 @@ def get_clusters_interfaces(clusters, extra_cond=lambda nic: True):
             expected = {"paravance": ["eth0", "eth1"]}
             assertDictEquals(expected, actual)
     """
-    utils.get_clusters_interfaces(clusters, extra_cond=extra_cond)
+
     interfaces = {}
     for cluster in clusters:
-        site = EX5.get_cluster_site(cluster)
-        nics = EX5.get_resource_attributes(
-            "/sites/%s/clusters/%s/nodes" % (site, cluster))
-        nics = nics['items'][0]['network_adapters']
-        nics = [nic['device'] for nic in nics
-            if nic['mountable'] and
-            nic['interface'] == 'Ethernet' and
-            not nic['management'] and extra_cond(nic)]
-        nics = sorted(nics)
+        nics = utils.get_cluster_interfaces(cluster, extra_cond=extra_cond)
         interfaces.setdefault(cluster, nics)
+
     return interfaces
+
+
+def exec_command_on_nodes(nodes, cmd, label, conn_params=None):
+    """Execute a command on a node (id or hostname) or on a set of nodes.
+
+    Args:
+        nodes (list):  list of targets of the command cmd. Each must be an
+    execo.Host.
+        cmd (str): string representing the command to run on the remote nodes.
+        label (str):  string for debugging purpose.
+        conn_params (dict): connection parameters passed to the execo.Remote
+    function.
+
+    """
+
+    remote.exec_command_on_nodes(nodes, cmd, label, conn_params)
 
 
 class Resources:
@@ -56,49 +84,46 @@ class Resources:
     Examples:
         .. code-block:: python
 
-            resources = { ... }
-            r = Resources(resources)
+            configuration = { ... }
+            r = Resources(configuration)
             r.reserve()
             r.deploy()
             r.configure_network()
 
         Or more concisely :
 
-            resources = { ... }
-            r = Resources(resources)
+            configuration = { ... }
+            r = Resources(configuration)
             r.launch()
 
-    Note that ``resources`` dict is not validated here, but can be through
-    the :py:func:`enoslib.infra.enos_g5k.schema.validate_schema` function
+    Note that ``configuration`` dict is not validated here, but can be through
+    the :py:func:`enoslib.infra.enos_g5k.schema.validate_schema` function and
+    thus follow the same syntax as the g5k provider.
     """
 
-    def __init__(self, resources):
-        self.resources = resources
+    def __init__(self, configuration):
+        self.configuration = configuration
         # This one will be modified
-        self.c_resources = copy.deepcopy(resources)
+        self.c_resources = copy.deepcopy(self.configuration["resources"])
+        # Load the driver that will interact with G5K
+        self.driver = get_driver(configuration)
 
-    def launch(self, **kwargs):
-        self.reserve(**kwargs)
-        self.deploy(**kwargs)
-        self.configure_network(**kwargs)
+    def launch(self):
+        self.reserve()
+        if self.configuration.get("job_type") == JOB_TYPE_DEPLOY:
+            self.deploy()
+            self.configure_network()
+        else:
+            # make sure we can connect as root on non-deploy nodes
+            self.grant_root_access()
 
-    def reserve(self, **kwargs):
-        job_name = kwargs.get("job_name", JOB_NAME)
-        walltime = kwargs.get("walltime", WALLTIME)
-        reservation_date = kwargs.get("reservation", False)
-        # NOTE(msimonin): some time ago asimonet proposes to auto-detect
-        # the queues and it was quiet convenient
-        # see https://github.com/BeyondTheClouds/enos/pull/62
-        queue = kwargs.get("queue", None)
-        gridjob = utils.get_or_create_job(
-            self.c_resources,
-            job_name,
-            walltime,
-            reservation_date,
-            queue)
-        utils.concretize_resources(self.c_resources, gridjob)
+    def reserve(self):
+        nodes, vlans, subnets = self.driver.reserve()
 
-    def deploy(self, **kwargs):
+        # The following as side-effect on self.c_resources
+        self._concretize_resources(nodes, vlans, subnets)
+
+    def deploy(self):
         def translate_vlan(primary_network, networks, nodes):
 
             def translate(node, vlan_id):
@@ -111,8 +136,9 @@ class Resources:
             net = utils.lookup_networks(primary_network, networks)
             vlan_id = net["_c_network"]["vlan_id"]
             return [translate(node, vlan_id) for node in nodes]
-        env_name = kwargs.get("env_name", ENV_NAME)
-        force_deploy = kwargs.get("force_deploy", False)
+
+        env_name = self.configuration.get("env_name", DEFAULT_ENV_NAME)
+        force_deploy = self.configuration.get("force_deploy", False)
 
         machines = self.c_resources["machines"]
         networks = self.c_resources["networks"]
@@ -140,13 +166,15 @@ class Resources:
                     networks,
                     desc["_c_deployed"])
 
-    def configure_network(self, **kwargs):
-        dhcp = kwargs.get("dhcp", False)
+    def configure_network(self):
+        dhcp = self.configuration.get("dhcp", False)
         utils.mount_nics(self.c_resources)
-        # TODO(msimonin): run dhcp if asked
         if dhcp:
             utils.dhcp_interfaces(self.c_resources)
         return self.c_resources
+
+    def grant_root_access(self):
+        utils.grant_root_access(self.c_resources)
 
     def get_networks(self):
         """Get the networks assoiated with the resource description.
@@ -177,19 +205,27 @@ class Resources:
         for desc in machines:
             roles = utils.get_roles_as_list(desc)
             hosts = self._denormalize(desc)
-            for r in roles:
-                result.setdefault(r, [])
-                result[r].extend(hosts)
+            for role in roles:
+                result.setdefault(role, [])
+                result[role].extend(hosts)
         return result
 
-    @staticmethod
-    def destroy(**kwargs):
+    def destroy(self):
         """Destroy the associated job."""
-        job_name = kwargs.get("job_name", JOB_NAME)
-        utils.destroy(job_name)
+        self.driver.destroy()
 
     def _denormalize(self, desc):
-            hosts = desc.get("_c_ssh_nodes", [])
-            nics = desc.get("_c_nics", [])
-            hosts = [{"host": h, "nics": nics} for h in hosts]
-            return hosts
+        hosts = desc.get("_c_ssh_nodes", desc.get("_c_nodes", []))
+        nics = desc.get("_c_nics", [])
+        hosts = [{"host": h, "nics": nics} for h in hosts]
+        return hosts
+
+    def _concretize_resources(self, nodes, vlans, subnets):
+        self._concretize_nodes(nodes)
+        self._concretize_networks(vlans, subnets)
+
+    def _concretize_nodes(self, nodes):
+        utils.concretize_nodes(self.c_resources, nodes)
+
+    def _concretize_networks(self, vlans, subnets):
+        utils.concretize_networks(self.c_resources, vlans, subnets)
